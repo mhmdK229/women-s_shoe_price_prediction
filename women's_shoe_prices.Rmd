@@ -1,0 +1,274 @@
+---
+title: "Predicting Women's Shoe Prices"
+author: 
+- "Muhammad Qais"
+
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+subtitle: Modelling
+---
+
+### Importing relevant libraries
+```{r}
+library(tidyverse)
+library(tidymodels)
+if (!require("xgboost")) {
+  install.packages("xgboost")
+}
+library(xgboost)
+if (!require("naniar")) {
+  install.packages("naniar")
+}
+library(naniar)
+if (!require("textfeatures")) {
+  install.packages("textfeatures")
+}
+library(textfeatures)
+if (!require("tidytext")) {
+  install.packages("tidytext")
+}
+library(tidytext)
+if (!require("text2vec")) {
+  install.packages("text2vec")
+}
+library(text2vec)
+```
+
+### Reading training data and splitting to different samples
+```{r}
+tidymodels_prefer()
+data <- read_rds("data/ebay_women_shoes_train.rds")
+data <- data %>% select(-c("id", "heel_type", "width", "shoe_width",
+                           "occasion", "shoe_size", "toe_shape", "size", "model",
+                           "year_of_manufacture", "closure", "fastening", "platform_height",
+                           "n_sold", "seller_notes"))
+
+# Set aside 10% to use for validation
+set.seed(42)
+val_split <- initial_split(data, prop = 0.1) 
+val <- training(val_split)
+shoes_train <- testing(val_split)
+
+# Set aside 30% to use for model tuning
+set.seed(42)
+tuning_split <- initial_split(shoes_train, prop = (1/3)) 
+tuning <- training(tuning_split)
+eng <- testing(tuning_split) # 60% to use for feature engineering
+```
+
+
+### Feature engineering
+#### Cleaning existing desired features
+```{r}
+clean_features <- function(data) {
+  data %>%
+    mutate_if(~is.character(.), tolower) %>%
+    rename(origin = country_region_of_manufacture) %>%
+    mutate(n_watchers = ifelse(is.na(n_watchers), 0, n_watchers),
+           free_shipping = ifelse(is.na(free_shipping), 0, free_shipping),
+           longtime_member = ifelse(is.na(longtime_member), 0, longtime_member),
+           same_day_shipping = ifelse(is.na(same_day_shipping), 0, same_day_shipping),
+           fast_safe_shipping = ifelse(is.na(fast_safe_shipping), 0, fast_safe_shipping),
+           returns = ifelse(is.na(returns), 0, returns),
+           feedback = ifelse(is.na(feedback), 0, feedback),
+           condition = ifelse(is.na(condition), "unknown", condition),
+           pattern = if_else(!is.na(pattern) | !is.na(theme), 1, 0),
+           origin = ifelse(is.na(origin) | origin == "n/a", "unknown", origin),
+           vintage = if_else(is.na(vintage) | substr(vintage, 1, 1) == "n", 0, 1),
+           heel_height = case_when(
+             grepl("high", heel_height) ~ "h",
+             grepl("med", heel_height) | grepl("mid", heel_height) ~ "m",
+             !(grepl("high", heel_height) | grepl("med", heel_height) | 
+                 grepl("mid", heel_height)) ~ "unknown"),
+           location = sapply(strsplit(location, ", "), function(x) {
+             ifelse(is.na(tail(x, 1)), "unknown", tail(x, 1))})
+           ) %>%
+    select(-c("brand", "style", "material", "lining_material", 
+            "upper_material", "colour", "color", "main_colour", 
+            "lining", "sole", "theme"))
+}
+```
+
+#### Extracting features from title
+```{r}
+tidy_titles <- eng %>%
+ mutate(id = 1:n(), log_price=log(price)) %>%
+ select(id, log_price, title) %>%
+ unnest_tokens(word, title) %>%
+ filter(!word %in% stop_words$word,
+ str_detect(word, "[a-z]"))
+
+min_n_words <- tidy_titles %>%
+ count(id, word) %>%
+ count(word) %>%
+ filter(n > 100) %>%
+ pull(word)
+
+ttest_sig <- function(data, target) {
+  target_data <- data %>% filter(word == target)
+  rest_data <- data %>% filter(!(id %in% target_data$id)) %>% 
+    distinct(id, log_price)
+  try({
+    return (t.test(select(target_data, log_price), select(rest_data, log_price))$p.value)
+  })
+  return (1)
+}
+
+ttest_res <- tidy_titles %>%
+  filter(word %in% min_n_words) %>%
+  distinct(word) %>%
+  mutate(pval = map(word, ~ttest_sig(tidy_titles, .x))) %>%
+  mutate(adj.pval = p.adjust(pval, method = "fdr"))
+
+sig_words <- ttest_res %>% filter(adj.pval < 0.01) %>% select(word)
+
+words_appear <- function(title) {
+  words <- c(sig_words$word, "rare", "sale", "new", " men", "kid", "\\$", "msrp")
+  appearances <- map(words, ~ifelse(str_detect(tolower(title), .x), 1, 0))
+  names(appearances) <- str_c("a_", words)
+  return (appearances)
+}
+
+title_features <- function(data) {
+  data$title %>%
+    textfeatures(normalize=FALSE, word_dims=10) %>%
+    select(n_words, n_uq_words, n_caps, n_lowers, n_polite,
+           sent_afinn, sent_bing, sent_syuzhet, sent_vader,
+           paste0("w", 1:10)) %>%
+    bind_cols(data) %>%
+    bind_cols(map_dfr(data$title, words_appear)) %>%
+    # Common Sense
+    select(-title)
+}
+```
+
+#### Full features
+```{r}
+full_features <- function(data, train=TRUE) { 
+  res <- title_features(clean_features(data)) 
+  if (train) {
+    res <- res %>% mutate(log_price = log(price)) %>% select(-price)  
+  }
+  return (res)
+}
+```
+
+### Model Tuning
+#### GBT
+```{r}
+tuning_engd <- full_features(tuning) 
+cv_splits <- vfold_cv(tuning_engd, v=5)
+```
+
+```{r}
+rec <- recipe(log_price ~., data=tuning_engd) %>% 
+       step_novel(all_nominal_predictors()) %>%     
+       step_dummy(all_nominal_predictors())
+mod <- boost_tree(mode="regression", engine="xgboost", trees=tune(),
+                  learn_rate=tune(), sample_size=tune())
+param_grid <- expand_grid(trees=c(500, 750, 1000), 
+                    learn_rate=c(0.001, 0.005, 0.01), 
+                    sample_size=c(0.25, 0.5, 0.75))
+```
+
+```{r}
+tune_res <- tune_grid(object=mod, preprocessor=rec, resamples=cv_splits, grid=param_grid,
+                      metrics=metric_set(rmse), control=control_grid(verbose=TRUE))
+collected_metrics <- collect_metrics(tune_res)
+```
+
+```{r}
+show_best(tune_res, n=5, metric="rmse")
+```
+
+### Testing against validation set
+#### Baseline model and comparison function
+```{r}
+baseline_model <- function(train) { # Receives raw data
+  mod <- lm(log(price) ~ category * condition + brand + free_shipping, data = train)
+  return (mod)
+}
+
+score_comparison <- function(score, baseline) {
+  return (score/baseline)
+}
+```
+
+#### Gather data
+```{r}
+train <- bind_rows(eng, tuning)
+top_brands <- train %>%
+  count(brand, sort = TRUE) %>%
+  slice(1:10) %>% pull(brand)
+train_baseline <- train %>% mutate(condition = ifelse(is.na(condition), "NA", condition)) %>%
+                            mutate(brand = ifelse(is.na(brand), "NA",
+                            ifelse(brand %in% top_brands, brand, "other"))) %>%
+                            mutate(free_shipping = ifelse(is.na(free_shipping), 0, free_shipping))
+
+train_ready <- full_features(train)
+rec <- recipe(log_price ~., data=train_ready) %>% 
+       step_novel(all_nominal_predictors()) %>%     
+       step_dummy(all_nominal_predictors()) %>%
+       prep(train_ready)
+train_ready <- rec %>% bake(train_ready)
+
+
+val_baseline <- val %>% mutate(condition = ifelse(is.na(condition), "NA", condition)) %>%
+                            mutate(brand = ifelse(is.na(brand), "NA",
+                            ifelse(brand %in% top_brands, brand, "other"))) %>%
+                            mutate(free_shipping = ifelse(is.na(free_shipping), 0, free_shipping))
+
+val_ready <- full_features(val)
+val_ready <- rec %>% bake(val_ready)
+```
+#### Model of choice
+```{r}
+set.seed(42)
+mod <- boost_tree(mode="regression", engine="xgboost", trees=1000,
+                  learn_rate=0.01, sample_size=0.75) %>% fit(log_price ~ ., data=train_ready)
+```
+
+#### Assess performance
+```{r}
+pred <- mod %>% predict(new_data=val_ready)
+rmse <- sqrt(mean(((pred-val_ready$log_price)^2)$.pred))
+rmse
+
+baseline_mod <- baseline_model(train_baseline)
+baseline_pred <- baseline_mod %>% predict(newdata=val_baseline)
+baseline_rmse <- sqrt(mean((baseline_pred-log(val_baseline$price))^2))
+baseline_rmse
+
+0.63*rmse/baseline_rmse 
+```
+
+### Predict on test set
+#### Gather data
+```{r}
+train_ready <- full_features(data)
+rec <- recipe(log_price ~., data=train_ready) %>% 
+       step_novel(all_nominal_predictors()) %>%     
+       step_dummy(all_nominal_predictors()) %>%
+       prep(train_ready)
+train_ready <- rec %>% bake(train_ready)
+
+test <- read_rds("data/ebay_women_shoes_test.rds")
+test_ready <- full_features(test, FALSE)
+test_ready <- rec %>% bake(test_ready)
+```
+
+#### Train model
+```{r}
+set.seed(42)
+mod <- boost_tree(mode="regression", engine="xgboost", trees=1000,
+                  learn_rate=0.01, sample_size=0.75) %>% fit(log_price ~ ., data=train_ready)
+```
+
+#### Predict on test data
+```{r}
+pred <- mod %>% predict(new_data=test_ready)
+write_csv(pred, "model1.csv")
+```
+
